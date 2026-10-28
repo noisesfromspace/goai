@@ -519,6 +519,10 @@ type responsesToolCall struct {
 	id   string
 	name string
 	args strings.Builder
+	// emitted records that the final ChunkToolCall went out. Providers differ
+	// in where the arguments arrive (deltas, arguments.done, or the completed
+	// item), so several events may try to finalize the same call.
+	emitted bool
 }
 
 // responsesReasoning tracks an in-flight reasoning block by output_index.
@@ -626,6 +630,31 @@ func streamResponsesWithConfig(
 	outputItems := make(map[int]json.RawMessage)
 	outputItemsBytes := 0
 	currentReasoningIdx := -1
+	// emitToolCall finalizes one function call exactly once. Args may arrive
+	// as deltas, only in response.function_call_arguments.done, or only on the
+	// completed item: whole is that authoritative string and is used when no
+	// deltas were streamed (OpenAI omits them for parallel calls). Emits
+	// nothing while the arguments are still unknown.
+	emitToolCall := func(active *responsesToolCall, whole string) bool {
+		if active.emitted {
+			return true
+		}
+		args := active.args.String()
+		if args == "" {
+			args = whole
+		}
+		if args == "" {
+			return true
+		}
+		active.emitted = true
+		active.args.Reset()
+		return provider.TrySend(ctx, out, provider.StreamChunk{
+			Type:       provider.ChunkToolCall,
+			ToolCallID: active.id,
+			ToolName:   active.name,
+			ToolInput:  args,
+		})
+	}
 	finish := func(items []json.RawMessage, response provider.ResponseMetadata, reason provider.FinishReason) {
 		content, err := responsesReplayContent(items, outputItems, messagePhases)
 		if err != nil {
@@ -634,11 +663,8 @@ func streamResponsesWithConfig(
 		}
 		// Both supported terminal forms must flush complete buffered tool args.
 		for _, index := range slices.Sorted(maps.Keys(activeTools)) {
-			active := activeTools[index]
-			if remaining := active.args.String(); remaining != "" {
-				if !provider.TrySend(ctx, out, provider.StreamChunk{Type: provider.ChunkToolCall, ToolCallID: active.id, ToolName: active.name, ToolInput: remaining}) {
-					return
-				}
+			if !emitToolCall(activeTools[index], "") {
+				return
 			}
 		}
 		if !provider.TrySend(ctx, out, provider.StreamChunk{Type: provider.ChunkStepFinish, FinishReason: reason}) {
@@ -981,7 +1007,8 @@ func streamResponsesWithConfig(
 
 		case "response.function_call_arguments.done":
 			var ev struct {
-				OutputIndex *int `json:"output_index"`
+				OutputIndex *int   `json:"output_index"`
+				Arguments   string `json:"arguments"`
 			}
 			ev.OutputIndex = new(int)
 			if err := decodeResponsesEvent(eventType, read.event.Data, &ev); err != nil {
@@ -993,16 +1020,8 @@ func streamResponsesWithConfig(
 				return
 			}
 			if active := activeTools[*ev.OutputIndex]; active != nil {
-				if remaining := active.args.String(); remaining != "" {
-					if !provider.TrySend(ctx, out, provider.StreamChunk{
-						Type:       provider.ChunkToolCall,
-						ToolCallID: active.id,
-						ToolName:   active.name,
-						ToolInput:  remaining,
-					}) {
-						return
-					}
-					active.args.Reset()
+				if !emitToolCall(active, ev.Arguments) {
+					return
 				}
 			}
 
@@ -1128,18 +1147,20 @@ func streamResponsesWithConfig(
 						return
 					}
 				} else if active := activeTools[*ev.OutputIndex]; active != nil {
-					// Safety net for an item closed without its arguments.done.
-					// The normal path resets the buffer, so this stays empty.
-					if remaining := active.args.String(); remaining != "" {
-						if !provider.TrySend(ctx, out, provider.StreamChunk{
-							Type:       provider.ChunkToolCall,
-							ToolCallID: active.id,
-							ToolName:   active.name,
-							ToolInput:  remaining,
-						}) {
+					// Safety net for an item closed without its arguments.done,
+					// and the only carrier for providers that send the arguments
+					// on the completed item alone.
+					var item struct {
+						Arguments string `json:"arguments"`
+					}
+					if len(ev.Item) > 0 {
+						if err := decodeResponsesEvent(eventType, ev.Item, &item); err != nil {
+							trySendResponsesError(ctx, out, err)
 							return
 						}
-						active.args.Reset()
+					}
+					if !emitToolCall(active, item.Arguments) {
+						return
 					}
 				}
 				delete(activeTools, *ev.OutputIndex)

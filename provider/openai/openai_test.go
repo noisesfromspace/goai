@@ -523,6 +523,94 @@ func TestChat_Responses_ToolCalls(t *testing.T) {
 	}
 }
 
+// The arguments of parallel tool calls arrive whole in
+// response.function_call_arguments.done, with no delta events at all. A
+// delta-only reader dropped the calls and the caller saw an empty step.
+func TestChat_Responses_ToolCallsArgsOnlyInDone(t *testing.T) {
+	calls := []struct{ callID, name, args string }{
+		{"call_1", "bash", `{"command":"ls /tmp"}`},
+		{"call_2", "bash", `{"command":"ls /var"}`},
+	}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		for i, call := range calls {
+			_, _ = fmt.Fprint(w, "event: response.output_item.added\n")
+			_, _ = fmt.Fprintf(w, `data: {"output_index":%d,"item":{"type":"function_call","call_id":%q,"name":%q,"arguments":""}}`+"\n\n", i, call.callID, call.name)
+			_, _ = fmt.Fprint(w, "event: response.function_call_arguments.done\n")
+			_, _ = fmt.Fprintf(w, `data: {"output_index":%d,"arguments":%q}`+"\n\n", i, call.args)
+			_, _ = fmt.Fprint(w, "event: response.output_item.done\n")
+			_, _ = fmt.Fprintf(w, `data: {"output_index":%d,"item":{"type":"function_call","call_id":%q,"name":%q,"arguments":%q}}`+"\n\n", i, call.callID, call.name, call.args)
+		}
+		_, _ = fmt.Fprint(w, "event: response.completed\n")
+		_, _ = fmt.Fprint(w, `data: {"response":{"usage":{"input_tokens":5,"output_tokens":10}}}`+"\n\n")
+	}))
+	defer server.Close()
+
+	toolCalls, deltas := collectResponsesToolCalls(t, server.URL)
+	if len(deltas) != 0 {
+		t.Errorf("expected no ChunkToolCallDelta, got %d", len(deltas))
+	}
+	if len(toolCalls) != len(calls) {
+		t.Fatalf("expected %d tool calls, got %d", len(calls), len(toolCalls))
+	}
+	for i, want := range calls {
+		if toolCalls[i].ToolCallID != want.callID || toolCalls[i].ToolName != want.name {
+			t.Errorf("call[%d] = %q/%q, want %q/%q", i, toolCalls[i].ToolCallID, toolCalls[i].ToolName, want.callID, want.name)
+		}
+		if toolCalls[i].ToolInput != want.args {
+			t.Errorf("call[%d].ToolInput = %q, want %q", i, toolCalls[i].ToolInput, want.args)
+		}
+	}
+}
+
+// A provider may close the item with the arguments only on the item itself:
+// no deltas, no arguments.done.
+func TestChat_Responses_ToolCallsArgsOnlyInItemDone(t *testing.T) {
+	const args = `{"path":"a.txt"}`
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = fmt.Fprint(w, "event: response.output_item.added\n")
+		_, _ = fmt.Fprint(w, `data: {"output_index":0,"item":{"type":"function_call","call_id":"tc1","name":"read","arguments":""}}`+"\n\n")
+		_, _ = fmt.Fprint(w, "event: response.output_item.done\n")
+		_, _ = fmt.Fprintf(w, `data: {"output_index":0,"item":{"type":"function_call","call_id":"tc1","name":"read","arguments":%q}}`+"\n\n", args)
+		_, _ = fmt.Fprint(w, "event: response.completed\n")
+		_, _ = fmt.Fprint(w, `data: {"response":{"usage":{"input_tokens":5,"output_tokens":10}}}`+"\n\n")
+	}))
+	defer server.Close()
+
+	toolCalls, _ := collectResponsesToolCalls(t, server.URL)
+	if len(toolCalls) != 1 {
+		t.Fatalf("expected 1 tool call, got %d", len(toolCalls))
+	}
+	if toolCalls[0].ToolInput != args {
+		t.Errorf("ToolInput = %q, want %q", toolCalls[0].ToolInput, args)
+	}
+}
+
+// collectResponsesToolCalls streams a Responses reply from url and returns the
+// final tool calls plus the argument deltas, in order.
+func collectResponsesToolCalls(t *testing.T, url string) (calls, deltas []provider.StreamChunk) {
+	t.Helper()
+	model := Chat("o3", WithAPIKey("test-key"), WithBaseURL(url))
+	result, err := model.DoStream(t.Context(), provider.GenerateParams{
+		Messages: []provider.Message{
+			{Role: provider.RoleUser, Content: []provider.Part{{Type: provider.PartText, Text: "go"}}},
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for chunk := range result.Stream {
+		switch chunk.Type {
+		case provider.ChunkToolCall:
+			calls = append(calls, chunk)
+		case provider.ChunkToolCallDelta:
+			deltas = append(deltas, chunk)
+		}
+	}
+	return calls, deltas
+}
+
 func TestChat_Responses_Generate_ToolCalls(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
